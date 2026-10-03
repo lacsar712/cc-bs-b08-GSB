@@ -129,3 +129,88 @@ th {
   background: #fff8e1;
   color: #f57f17;
 }
+
+.tag.block {
+  background: #ede7f6;
+  color: #5e35b1;
+}
+
+tr.blocked-row {
+  background: #f6f2fc;
+}
+
+tr.blocked-row td {
+  color: #5e35b1;
+}
+
+.topright {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.5rem;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+}
+
+button.active {
+  background: #1565c0;
+}
+
+.userline {
+  font-size: 0.9rem;
+  color: #333;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.lamp {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: 0.6rem;
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
+.lamp::before {
+  content: "";
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.lamp.on {
+  background: #e8f5e9;
+  color: #2e7d32;
+}
+
+.lamp.off {
+  background: #eceff1;
+  color: #607d8b;
+}
+
+.lamp.sm {
+  padding: 0.05rem 0.4rem;
+  font-size: 0.72rem;
+  margin-left: 0.35rem;
+}
+
+label.switch {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+label.switch input {
+  min-width: 0;
+  width: 1.1rem;
+  height: 1.1rem;
+}

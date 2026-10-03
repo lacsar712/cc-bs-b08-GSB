@@ -22,6 +22,36 @@ CREATE TABLE IF NOT EXISTS strain_readings (
     processed_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS idx_strain_readings_status ON strain_readings (status, id);
+
+-- 异常噪声滤波配置：全表单行（id = 1），是开关灯 / 判定 / 写口的唯一真源。
+CREATE TABLE IF NOT EXISTS filter_settings (
+    id smallint PRIMARY KEY DEFAULT 1,
+    enabled boolean NOT NULL DEFAULT false,
+    window_size integer NOT NULL DEFAULT 5,
+    threshold_multiplier double precision NOT NULL DEFAULT 3.0,
+    updated_by text,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT filter_settings_singleton CHECK (id = 1)
+);
+INSERT INTO filter_settings (id, enabled, window_size, threshold_multiplier)
+VALUES (1, false, 5, 3.0)
+ON CONFLICT (id) DO NOTHING;
+
+-- 噪声过滤流水：每一笔挡回都与入账在同一事务落库。
+CREATE TABLE IF NOT EXISTS filter_log (
+    id serial PRIMARY KEY,
+    reading_id integer NOT NULL REFERENCES strain_readings(id),
+    span_code text NOT NULL,
+    microstrain double precision NOT NULL,
+    baseline_median double precision,
+    deviation double precision,
+    threshold_multiplier double precision NOT NULL,
+    window_size integer NOT NULL,
+    reason text NOT NULL,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_filter_log_reading ON filter_log (reading_id);
 """
 
 

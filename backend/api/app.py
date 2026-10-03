@@ -7,6 +7,7 @@ from sanic import Sanic
 from sanic.response import json as sanic_json
 
 from db import create_pool, ensure_schema, seed_if_empty
+from rules import is_abrupt_spike, median_of
 
 SECRET = os.environ.get("JWT_SECRET", "bridge-strain-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -50,6 +51,16 @@ def _iso(dt) -> str | None:
     if dt is None:
         return None
     return dt.isoformat()
+
+
+def _settings_dict(r) -> dict:
+    return {
+        "enabled": r["enabled"],
+        "window_size": r["window_size"],
+        "threshold_multiplier": r["threshold_multiplier"],
+        "updated_by": r["updated_by"],
+        "updated_at": _iso(r["updated_at"]),
+    }
 
 
 @app.before_server_start
@@ -143,18 +154,108 @@ async def create_reading(request):
 
     pool = request.app.ctx.pool
     async with pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                INSERT INTO strain_readings (span_code, microstrain, status, created_by, created_at)
-                VALUES (%s, %s, 'pending', %s, now())
-                RETURNING id, span_code, microstrain, verdict, reason, status,
-                          created_by, created_at, processed_at
-                """,
-                (span_code, microstrain, user["username"]),
-            )
-            row = await cur.fetchone()
-        await conn.commit()
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                # 锁定单行配置：滤波判定、写口、专页开关灯全部同源读取此行，
+                # 行锁同时把临界并发的两笔提交串行化，至多一笔进入待处理队列。
+                await cur.execute(
+                    "SELECT enabled, window_size, threshold_multiplier "
+                    "FROM filter_settings WHERE id = 1 FOR UPDATE"
+                )
+                settings = await cur.fetchone()
+                enabled = bool(settings["enabled"])
+                window_size = int(settings["window_size"])
+                multiplier = float(settings["threshold_multiplier"])
+
+                if enabled:
+                    await cur.execute(
+                        """
+                        SELECT microstrain FROM strain_readings
+                        WHERE span_code = %s AND status IN ('pending', 'processing', 'done')
+                        ORDER BY id DESC
+                        LIMIT %s
+                        """,
+                        (span_code, window_size),
+                    )
+                    recent = [float(r["microstrain"]) for r in await cur.fetchall()]
+                    baseline = median_of(recent)
+                    spike, deviation, limit = is_abrupt_spike(
+                        microstrain, baseline, multiplier
+                    )
+                else:
+                    baseline = None
+                    spike = False
+                    deviation = None
+                    limit = None
+
+                if spike:
+                    # 挡回：整笔以 blocked 入账，并与过滤流水同一事务落库。
+                    reason = (
+                        f"异常噪声已挡回：读数 {microstrain:g} 与窗口中位 "
+                        f"{baseline:g} 的偏差 {deviation:g} με 超过阈值 "
+                        f"{multiplier:g} 倍中位（{limit:g}）"
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO strain_readings
+                            (span_code, microstrain, verdict, reason, status,
+                             created_by, created_at, processed_at)
+                        VALUES (%s, %s, '异常噪声', %s, 'blocked', %s, now(), now())
+                        RETURNING id, span_code, microstrain, verdict, reason, status,
+                                  created_by, created_at, processed_at
+                        """,
+                        (span_code, microstrain, reason, user["username"]),
+                    )
+                    row = await cur.fetchone()
+                    await cur.execute(
+                        """
+                        INSERT INTO filter_log
+                            (reading_id, span_code, microstrain, baseline_median,
+                             deviation, threshold_multiplier, window_size, reason,
+                             created_by, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                        """,
+                        (
+                            row["id"],
+                            span_code,
+                            microstrain,
+                            baseline,
+                            deviation,
+                            multiplier,
+                            window_size,
+                            reason,
+                            user["username"],
+                        ),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        INSERT INTO strain_readings (span_code, microstrain, status, created_by, created_at)
+                        VALUES (%s, %s, 'pending', %s, now())
+                        RETURNING id, span_code, microstrain, verdict, reason, status,
+                                  created_by, created_at, processed_at
+                        """,
+                        (span_code, microstrain, user["username"]),
+                    )
+                    row = await cur.fetchone()
+
+    if spike:
+        return sanic_json(
+            {
+                "id": row["id"],
+                "span_code": row["span_code"],
+                "microstrain": row["microstrain"],
+                "verdict": row["verdict"],
+                "reason": row["reason"],
+                "status": row["status"],
+                "created_by": row["created_by"],
+                "created_at": _iso(row["created_at"]),
+                "processed_at": _iso(row["processed_at"]),
+                "blocked": True,
+                "message": "读数突变超过窗口中位阈值，已作为异常噪声挡回",
+            },
+            status=202,
+        )
 
     return sanic_json(
         {
@@ -171,3 +272,113 @@ async def create_reading(request):
         },
         status=201,
     )
+
+
+@app.get("/api/filter/settings")
+async def get_filter_settings(request):
+    if not _require_user(request):
+        return sanic_json({"detail": "未登录"}, status=401)
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT enabled, window_size, threshold_multiplier, updated_by, updated_at "
+                "FROM filter_settings WHERE id = 1"
+            )
+            r = await cur.fetchone()
+    return sanic_json(_settings_dict(r))
+
+
+@app.put("/api/filter/settings")
+async def update_filter_settings(request):
+    user = _require_user(request)
+    if not user:
+        return sanic_json({"detail": "未登录"}, status=401)
+    # 复核员只读：不能切换滤波开关或改动参数。
+    if user["role"] != "writer":
+        return sanic_json({"detail": "复核员为只读，不能修改滤波设置"}, status=403)
+
+    body = request.json or {}
+    fields: dict = {}
+    if "enabled" in body:
+        if not isinstance(body["enabled"], bool):
+            return sanic_json({"detail": "enabled 必须为布尔值"}, status=400)
+        fields["enabled"] = body["enabled"]
+    if "window_size" in body:
+        try:
+            window_size = int(body["window_size"])
+        except (TypeError, ValueError):
+            return sanic_json({"detail": "窗口长度必须是整数"}, status=400)
+        if not 1 <= window_size <= 200:
+            return sanic_json(
+                {"detail": "窗口长度需在 1～200 之间"}, status=400
+            )
+        fields["window_size"] = window_size
+    if "threshold_multiplier" in body:
+        try:
+            multiplier = float(body["threshold_multiplier"])
+        except (TypeError, ValueError):
+            return sanic_json({"detail": "阈值倍数必须是数字"}, status=400)
+        if not 0 < multiplier <= 100:
+            return sanic_json(
+                {"detail": "阈值倍数需在 0～100 之间"}, status=400
+            )
+        fields["threshold_multiplier"] = multiplier
+    if not fields:
+        return sanic_json({"detail": "没有需要更新的字段"}, status=400)
+
+    assignments = ", ".join(f"{k} = %s" for k in fields)
+    params = list(fields.values())
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                UPDATE filter_settings
+                SET {assignments}, updated_by = %s, updated_at = now()
+                WHERE id = 1
+                RETURNING enabled, window_size, threshold_multiplier,
+                          updated_by, updated_at
+                """,
+                (*params, user["username"]),
+            )
+            r = await cur.fetchone()
+        await conn.commit()
+    return sanic_json(_settings_dict(r))
+
+
+@app.get("/api/filter/logs")
+async def list_filter_logs(request):
+    if not _require_user(request):
+        return sanic_json({"detail": "未登录"}, status=401)
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, reading_id, span_code, microstrain, baseline_median,
+                       deviation, threshold_multiplier, window_size, reason,
+                       created_by, created_at
+                FROM filter_log
+                ORDER BY id DESC
+                LIMIT 200
+                """
+            )
+            rows = await cur.fetchall()
+    out = [
+        {
+            "id": r["id"],
+            "reading_id": r["reading_id"],
+            "span_code": r["span_code"],
+            "microstrain": r["microstrain"],
+            "baseline_median": r["baseline_median"],
+            "deviation": r["deviation"],
+            "threshold_multiplier": r["threshold_multiplier"],
+            "window_size": r["window_size"],
+            "reason": r["reason"],
+            "created_by": r["created_by"],
+            "created_at": _iso(r["created_at"]),
+        }
+        for r in rows
+    ]
+    return sanic_json(out)
